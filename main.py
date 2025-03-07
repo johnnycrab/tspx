@@ -6,7 +6,7 @@ import jax.numpy as jnp
 import optax
 from flax import nnx
 from jax.sharding import Mesh, PartitionSpec, NamedSharding
-from dataset import TSPDataset
+from dataset import TSPDataset, donothing_collate
 from torch.utils.data import DataLoader
 from network import TSPNetwork
 from functools import partial
@@ -22,10 +22,10 @@ seed = 43
 TRAIN_DATASET_PATH = "./data/tsp_100_10k.pickle"
 VAL_DATASET_PATH = "./data/tsp_100_10k.pickle"
 learning_rate = 2e-4
-num_epochs = 100
+num_epochs = 1000
 num_batches_per_epoch = 50
 batch_size = 32
-validation_batch_size = 25
+validation_batch_size = 50  # must divide the number of instances present in VAL_DATASET_PATH
 
 ## Training methods
 
@@ -63,27 +63,30 @@ def train_step(model: TSPNetwork, optimizer: nnx.Optimizer, metrics: nnx.Metric,
 # Jumanji TSP rollout methods
 
 
-@nnx.jit
-def log_probability_fn(model: TSPNetwork, states: State):
+@partial(nnx.jit, static_argnames="sharding")
+def log_probability_fn(model: TSPNetwork, sharding: NamedSharding, states: State):
     """
     Given a batch of states and TSPNetwork, return logits
     for the next actions. Function is jitted, so we should make sure to
     not vary the batch size.
     """
+    batch = jax.vmap(state_to_network_rep)(states)
+    batch = jax.tree.map(lambda x: jax.lax.with_sharding_constraint(x, sharding), batch)
     logits = model(
-        jax.vmap(state_to_network_rep)(states)
+        batch
     )
     return nnx.log_softmax(logits)
 
 
-@partial(nnx.jit, static_argnames=("env_wrapper"))
-def batch_greedy_rollout(model: TSPNetwork, env_wrapper: TSP, initial_states: State, initial_timesteps: TimeStep) -> tuple[State, TimeStep, TSPNetwork]:
+@partial(nnx.jit, static_argnames=("sharding", "env_wrapper"))
+def batch_greedy_rollout(model: TSPNetwork, sharding: NamedSharding, env_wrapper: TSP, initial_states: State, initial_timesteps: TimeStep) -> tuple[State, TimeStep, TSPNetwork]:
     """
     Greedy rollout given a batch of states and a model.
 
     Args:
         model: TSPNetwork instance
         env_wrapper: TSP environment from which we can call the step_fn
+        sharding: NamedSharding on which to constrain the batches of states piped into network.
         initial_states: Batch of TSP states given as PyTree, initialized where first action has already been taken
         initial_timesteps: Batch of TSP timesteps given as PyTree, initialized where first action has already been taken
 
@@ -94,7 +97,7 @@ def batch_greedy_rollout(model: TSPNetwork, env_wrapper: TSP, initial_states: St
 
     def body_fun(input):
         states, timesteps, network = input
-        logits = log_probability_fn(network, states)  # batched logits
+        logits = log_probability_fn(network, sharding, states)  # batched logits
         # get argmax of logits, corresponding to greedy action
         actions = jnp.argmax(logits, axis=-1)
         new_states, new_timesteps = step_fn(states, actions)
@@ -116,14 +119,16 @@ if __name__ == '__main__':
 
     # Prepare dataset and dataloader
     train_dataset = TSPDataset(path_to_pickle=TRAIN_DATASET_PATH,
+                               batch_size=batch_size,
+                               num_batches=num_batches_per_epoch,
                                data_augmentation=True,
                                data_augmentation_linear_scale=True,
                                augment_direction=True,
                                custom_num_instances=None
                                )
     loader = DataLoader(train_dataset,
-                        batch_size=batch_size, shuffle=True, num_workers=1, drop_last=True,
-                        prefetch_factor=2, pin_memory=True, persistent_workers=True)
+                        batch_size=1, shuffle=False, num_workers=1, drop_last=False, collate_fn=donothing_collate,
+                        prefetch_factor=2, persistent_workers=True)
 
     # Init network
     network = TSPNetwork(latent_dim=128, num_trf_blocks=3, num_attn_heads=8, feedforward_dim=512, dropout=0.0, rngs=nnx.Rngs(seed))
@@ -146,11 +151,11 @@ if __name__ == '__main__':
 
     # Training loop
     for epoch in range(1, num_epochs + 1):
+        data_iter = iter(loader)
+
         with mesh:
             network.train()
-            data_iter = iter(loader)
             num_batches = min(num_batches_per_epoch, len(loader))
-
             for i in (progress_bar := tqdm(range(num_batches))):
                 # `next(data_iter)` returns the batch as a dict of PyTorch tensors. Convert them to jnp.Array.
                 jnp_batch = jax.tree.map(lambda x: jax.device_put(jnp.asarray(x), data_sharding), next(data_iter))
@@ -170,8 +175,7 @@ if __name__ == '__main__':
             tour_lengths = []
             for i in (progress_bar := tqdm(range(len(idx_batches)))):
                 state_batch, timestep_batch = batch_env_reset_and_visit_first(env, idx_batches[i])
-                jax.debug.visualize_array_sharding(state_batch.coordinates[:, :, 0])
-                term_states, term_timesteps, _ = batch_greedy_rollout(network, env, state_batch, timestep_batch)
+                term_states, term_timesteps, _ = batch_greedy_rollout(network, data_sharding, env, state_batch, timestep_batch)
                 tour_lengths.append(- np.asarray(term_timesteps.reward))
             tour_lengths = np.concatenate(tour_lengths)
             mean_tour_length = tour_lengths.mean()

@@ -1,14 +1,15 @@
 import pickle
 import numpy as np
-import torch
-from jax import tree_map
+import random
 from torch.utils import data
-from typing import Tuple, Optional
+from typing import Optional
 
 from tsp_geometry import TSPGeometry
 
-def numpy_collate(batch):
-    return tree_map(np.asarray, data.default_collate(batch))
+
+def donothing_collate(batch):
+    return batch[0]
+
 
 class TSPDataset(data.Dataset):
     """
@@ -31,7 +32,7 @@ class TSPDataset(data.Dataset):
             the next_node_idx will always be 0 (i.e., the first unvisited node in the optimal subtour)
     }
     """
-    def __init__(self, path_to_pickle: str,
+    def __init__(self, path_to_pickle: str, batch_size: int, num_batches: int,
                  data_augmentation: bool = False, data_augmentation_linear_scale: bool = False,
                  augment_direction: bool = False, custom_num_instances: Optional[int] = None,
                  ):
@@ -39,6 +40,11 @@ class TSPDataset(data.Dataset):
         Parameters:
             path_to_pickle [str]: Path to file with expert trajectories.
                 We assume that the number of cities in each instance is constant.
+            batch_size [int]: In this dataset, each item corresponds to a full batch (hacky for faster performance
+                with a large number of TSP instances).
+                This gives the full batch size.
+            num_batches [int]: In this dataset, each item corresponds to a full batch. This gives the number full
+                length of the dataset.
             data_augmentation [bool]: If True, a random
                 geometric augmentation (rotation, flipping) is performed on the instance
                 before choosing a subtour.
@@ -59,11 +65,8 @@ class TSPDataset(data.Dataset):
 
         self.num_nodes = self.instances[0]["inst"].shape[0]  # number of cities in each instance.
 
-        # Calculate the length of the dataset. We have countless options of flipping / rotation / random order
-        # of subtour and taking start/end nodes. Disregarding geometric augmentation and the order, we say for each
-        # instance, there are n possibilities for the start node. For each start node, there are n-2 options for choosing
-        # 4 <= k <= n+1.
-        self.length = len(self.instances) * self.num_nodes * (self.num_nodes - 2)
+        self.length = self.num_batches = num_batches
+        self.batch_size = batch_size
 
         print(f"Loaded dataset from {path_to_pickle}. Num instances: {len(self.instances)}. Total length: {self.length}")
 
@@ -86,42 +89,53 @@ class TSPDataset(data.Dataset):
         """
         See class docstring for description of a single item.
         """
-        instance_idx, start_node_idx, k = self.subtour_location_from_idx(idx)
+        to_stack_nodes: list[np.array] = []  # list of nodes of shape (n + 2, 2). Each entry corresponds to one item in batch.
+        to_stack_masks: list[np.array] = []  # list of masks of shape (n+2,). Each entry corresponds to one item in batch.
 
-        nodes = self.instances[instance_idx]["inst"]
-        optimal_full_tour = list(self.instances[instance_idx]["tour"])
+        for _ in range(self.batch_size):
+            # Random subtour length. We start at subtours of length 4 (everything below is trivial).
+            k = random.randint(4, self.num_nodes + 1)
+            # Get random instance
+            instance_idx = random.randint(0, len(self.instances) - 1)
+            # Get random start point of subtour
+            start_node_idx = random.randint(0, self.num_nodes - 1)
 
-        subtour = optimal_full_tour[start_node_idx: start_node_idx + k]
-        if len(subtour) < k:  # wrap around
-            subtour = subtour + optimal_full_tour[0: k - len(subtour)]
+            nodes = self.instances[instance_idx]["inst"]
+            optimal_full_tour = list(self.instances[instance_idx]["tour"])
 
-        if self.augment_direction and np.random.randint(0, 2) == 0:
-            # reverse order of tour
-            subtour = subtour[::-1]
+            subtour = optimal_full_tour[start_node_idx: start_node_idx + k]
+            if len(subtour) < k:  # wrap around
+                subtour = subtour + optimal_full_tour[0: k - len(subtour)]
 
-        if self.data_augmentation:
-            nodes = TSPGeometry.random_state_augmentation(nodes, do_linear_scale=self.data_augmentation_linear_scale)
+            if self.augment_direction and np.random.randint(0, 2) == 0:
+                # reverse order of tour
+                subtour = subtour[::-1]
 
-        # Move the destination node to index 1, and pad with zeros to length n+1
-        nodes = nodes[subtour]
+            if self.data_augmentation:
+                nodes = TSPGeometry.random_state_augmentation(nodes, do_linear_scale=self.data_augmentation_linear_scale)
 
-        num_padded_nodes = self.num_nodes + 2 - k
-        nodes = np.concatenate((
-            nodes[:1],
-            nodes[-1:],
-            nodes[1:-1],
-            np.zeros((num_padded_nodes, 2))
-        ), axis=0
-        )
+            # Move the destination node to index 1, and pad with zeros to length n+1
+            nodes = nodes[subtour]
 
-        # Padded nodes mask for attention
-        mask = np.pad(
-            np.ones(k, dtype=bool),
-            pad_width=((0, num_padded_nodes),), mode='constant', constant_values=0
-        )
+            num_padded_nodes = self.num_nodes + 2 - k
+            nodes = np.concatenate((
+                nodes[:1],
+                nodes[-1:],
+                nodes[1:-1],
+                np.zeros((num_padded_nodes, 2))
+            ), axis=0
+            )
+
+            # Padded nodes mask for attention
+            mask = np.pad(
+                np.ones(k, dtype=bool),
+                pad_width=((0, num_padded_nodes),), mode='constant', constant_values=0
+            )
+            to_stack_nodes.append(nodes)
+            to_stack_masks.append(mask)
 
         return {
-            "nodes": torch.from_numpy(nodes),
-            "mask": torch.from_numpy(mask).bool(),
-            "next_node_idx": torch.LongTensor([0])  # The target idx to choose is - when discarding the first and last node - always 0!
+            "nodes": np.float32(np.stack(to_stack_nodes, axis=0)),
+            "mask": np.stack(to_stack_masks, axis=0),
+            "next_node_idx": np.zeros((self.batch_size, 1), dtype=int)  # The target idx to choose is - when discarding the first and last node - always 0!
         }
