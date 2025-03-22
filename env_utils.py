@@ -18,10 +18,12 @@ class InstancesFromFileGenerator(Generator):
     key, as is done in the UniformGenerator used by jumanji).
     """
 
-    def __init__(self, num_cities: int, path_to_pickle: str):
+    def __init__(self, num_cities: int, path_to_pickle: str, custom_num_instances: int | None):
         super().__init__(num_cities)
         with open(path_to_pickle, "rb") as f:
-            instances = pickle.load(f)[:200]
+            instances = pickle.load(f)
+        if custom_num_instances is not None:
+            instances = instances[:custom_num_instances]
         self.coordinates = [x["inst"] for x in instances]  # list of np.array of shape (num_cities, 2)
         self.optimal_lengths = np.array([x["sol"] for x in instances])
         self.length = len(self.coordinates)
