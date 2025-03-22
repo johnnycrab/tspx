@@ -10,6 +10,5 @@ We base the TSP environment on Jumanji (https://github.com/instadeepai/jumanji/)
 
 ## Steps to do
 
-- First, we build a PyTorch Dataloader that loads in the batches but collates them to numpy
-- We write the Transformer module in NNX
-- Training loop written in NNX
+- Checkpoint saving and loading
+- Beam search
